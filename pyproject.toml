@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "malscore"
+version = "0.1.0"
+description = "Score the maliciousness of a Linux command or shell script (0-100) with MITRE ATT&CK mapping. Never executes its input."
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = []
+
+[project.scripts]
+malscore = "cmdfeat.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["cmdfeat*"]
