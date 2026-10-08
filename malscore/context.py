@@ -1,19 +1,23 @@
-"""Shared per-event analysis context.
+"""Shared per-command analysis context.
 
 Building the context is the only expensive step: it lexes the command line,
 resolves *effective* executables (unwrapping ``sudo``/``env``/``xargs``...),
 descends into command substitutions, shell ``-c`` payloads and remote command
-arguments, and extracts paths, URLs, IPs, domains and ports once.  Every
-feature module then reads from this context instead of re-scanning the string.
+arguments, and extracts paths, URLs, IPs and ports once.  Every feature group
+then reads from this context instead of re-scanning the string.
+
+Everything here is read-only string analysis.  No command is ever executed,
+expanded or resolved.
 """
 
 from __future__ import annotations
 
+import ipaddress
+import re
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Set
+from urllib.parse import urlsplit
 
-from . import textutil as tu
-from .events import Event
 from .lexer import ParsedCommand, SimpleCommand, tokenize
 
 # --------------------------------------------------------------------------
@@ -108,18 +112,13 @@ class Execution:
     wrappers: List[str] = field(default_factory=list)
     assignments: List[str] = field(default_factory=list)
     command: Optional[SimpleCommand] = None
-    nested: bool = False              # found inside a substitution/payload/remote command
-
-    @property
-    def flags(self) -> List[str]:
-        return [a for a in self.args if is_flag(a)]
 
     @property
     def positionals(self) -> List[str]:
         return [a for a in self.args if not is_flag(a) and not is_assignment(a)]
 
 
-def resolve_execution(command: SimpleCommand, nested: bool = False) -> Optional[Execution]:
+def resolve_execution(command: SimpleCommand) -> Optional[Execution]:
     """Find the effective executable of a simple command.
 
     ``sudo -u svc env FOO=1 timeout 30 python3 app.py`` resolves to ``python3``
@@ -151,12 +150,7 @@ def resolve_execution(command: SimpleCommand, nested: bool = False) -> Optional[
             while index < len(argv):
                 current = argv[index]
                 if is_flag(current):
-                    if current in value_flags:
-                        index += 2
-                    elif "=" in current and current.startswith("--"):
-                        index += 1
-                    else:
-                        index += 1
+                    index += 2 if current in value_flags else 1
                     continue
                 if is_assignment(current):
                     assignments.append(current)
@@ -178,7 +172,7 @@ def resolve_execution(command: SimpleCommand, nested: bool = False) -> Optional[
             name = wrappers[-1]
             return Execution(name=name, basename=name, argv=argv,
                              args=argv[1:] if argv else [], wrappers=wrappers[:-1],
-                             assignments=assignments, command=command, nested=nested)
+                             assignments=assignments, command=command)
         return None
     name = argv[index]
     return Execution(
@@ -189,7 +183,6 @@ def resolve_execution(command: SimpleCommand, nested: bool = False) -> Optional[
         wrappers=wrappers,
         assignments=assignments,
         command=command,
-        nested=nested,
     )
 
 
@@ -203,27 +196,28 @@ def inline_payload(execution: Execution) -> Optional[str]:
     return None
 
 
+#: ssh options that consume the following argument.
+SSH_VALUE_FLAGS = frozenset({"-i", "-p", "-l", "-o", "-F", "-J", "-b", "-c", "-D", "-L", "-R", "-W"})
+
+
 def remote_payload(execution: Execution) -> Optional[str]:
     """Return the command a remote/container runner is asked to run."""
     base = execution.basename
     args = execution.args
     if base == "ssh":
-        positionals = [a for a in args if not is_flag(a)]
         skip_next = False
         cleaned: List[str] = []
         for token in args:
             if skip_next:
                 skip_next = False
                 continue
-            if token in ("-i", "-p", "-l", "-o", "-F", "-J", "-b", "-c", "-D", "-L", "-R", "-W"):
+            if token in SSH_VALUE_FLAGS:
                 skip_next = True
                 continue
             if is_flag(token):
                 continue
             cleaned.append(token)
-        if len(cleaned) >= 2:
-            return " ".join(cleaned[1:])
-        return None
+        return " ".join(cleaned[1:]) if len(cleaned) >= 2 else None
     if base in ("docker", "podman", "nerdctl", "ctr", "crictl") and args:
         if args[0] in ("run", "exec"):
             positionals = [a for a in args[1:] if not is_flag(a)]
@@ -232,12 +226,171 @@ def remote_payload(execution: Execution) -> Optional[str]:
         return None
     if base == "kubectl" and "--" in args:
         return " ".join(args[args.index("--") + 1:])
-    if base in ("nsenter", "unshare", "chroot") and execution.positionals:
-        return " ".join(execution.positionals[1:]) if base == "chroot" else None
+    if base == "chroot" and execution.positionals:
+        return " ".join(execution.positionals[1:])
     if base == "su":
-        payload = inline_payload(execution)
-        return payload
+        return inline_payload(execution)
     return None
+
+
+# --------------------------------------------------------------------------
+# network indicators
+# --------------------------------------------------------------------------
+URL_RE = re.compile(
+    r"(?i)\b(?P<scheme>[a-z][a-z0-9+.\-]{1,15})://(?P<rest>[^\s'\"`<>|;)\\]+)"
+)
+IPV4_RE = re.compile(r"(?<![\w.])((?:\d{1,3}\.){3}\d{1,3})(?![\w.])")
+IPV6_CANDIDATE_RE = re.compile(r"(?<![\w:])((?:[A-Fa-f0-9]{0,4}:){2,7}[A-Fa-f0-9]{0,4}(?:%\w+)?)(?![\w:])")
+HOST_PORT_RE = re.compile(r"(?<=[\w\].]):(\d{1,5})(?![\w.])")
+
+
+@dataclass
+class UrlRef:
+    """A URL found in a command line, decomposed into parts."""
+
+    raw: str
+    scheme: str = ""
+    host: str = ""
+    port: Optional[int] = None
+    path: str = ""
+    host_is_ip: bool = False
+
+
+def _is_ip(value: str) -> bool:
+    try:
+        ipaddress.ip_address(value.strip("[]"))
+        return True
+    except ValueError:
+        return False
+
+
+def extract_urls(text: str) -> List[UrlRef]:
+    """Find URL-like substrings and split them into components."""
+    urls: List[UrlRef] = []
+    for match in URL_RE.finditer(text):
+        raw = match.group(0).rstrip(".,;:!)\"'")
+        try:
+            parts = urlsplit(raw)
+        except ValueError:
+            continue
+        host = parts.hostname or ""
+        try:
+            port = parts.port
+        except ValueError:
+            port = None
+        urls.append(UrlRef(raw=raw, scheme=(parts.scheme or "").lower(), host=host, port=port,
+                           path=parts.path or "", host_is_ip=bool(host) and _is_ip(host)))
+    return urls
+
+
+def extract_ipv4(text: str) -> List[str]:
+    found: List[str] = []
+    for match in IPV4_RE.finditer(text):
+        try:
+            ipaddress.IPv4Address(match.group(1))
+        except ValueError:
+            continue
+        found.append(match.group(1))
+    return found
+
+
+def extract_ipv6(text: str) -> List[str]:
+    found: List[str] = []
+    for match in IPV6_CANDIDATE_RE.finditer(text):
+        candidate = match.group(1).split("%")[0]
+        if candidate.count(":") < 2:
+            continue
+        try:
+            ipaddress.IPv6Address(candidate)
+        except ValueError:
+            continue
+        found.append(candidate)
+    return found
+
+
+def extract_ports(text: str, urls: Sequence[UrlRef], argv_lists: Sequence[Sequence[str]]) -> List[int]:
+    """Ports from URLs, ``host:port`` pairs and ``-p``/``--port`` options."""
+    ports: List[int] = [u.port for u in urls if u.port]
+    for match in HOST_PORT_RE.finditer(text):
+        ports.append(int(match.group(1)))
+    for argv in argv_lists:
+        for index, token in enumerate(argv):
+            if token in ("-p", "--port", "-P", "--source-port") and index + 1 < len(argv):
+                if argv[index + 1].isdigit():
+                    ports.append(int(argv[index + 1]))
+            elif token.startswith("--port="):
+                tail = token.split("=", 1)[1]
+                if tail.isdigit():
+                    ports.append(int(tail))
+    return [p for p in ports if 0 < p <= 65535]
+
+
+# --------------------------------------------------------------------------
+# paths
+# --------------------------------------------------------------------------
+SED_EXPR_RE = re.compile(r"^[sy]([/|,#!:])(?:[^\1]|\\.)*\1")
+
+
+@dataclass
+class PathRef:
+    """A filesystem path found in a command line."""
+
+    raw: str
+    basename: str = ""
+    extension: str = ""
+    from_redirect: bool = False
+
+    @property
+    def lowered(self) -> str:
+        return self.raw.lower()
+
+
+def looks_like_path(token: str) -> bool:
+    """Heuristic: does this argument denote a filesystem path?
+
+    Deliberately conservative -- ``sed`` expressions, URLs, option values and
+    quoted remote commands are common sources of false positives, so they are
+    filtered out explicitly.
+    """
+    if not token or token in ("-", "--"):
+        return False
+    if "://" in token:
+        return False
+    if any(ch.isspace() for ch in token):
+        return False            # a quoted remote command, not a path
+    if "$(" in token or "`" in token or token.startswith("$"):
+        return False            # a substitution, not a path
+    if token.startswith("-"):
+        return False
+    if SED_EXPR_RE.match(token):
+        return False
+    if token in (".", ".."):
+        return True
+    return token.startswith("~") or "/" in token
+
+
+def make_path_ref(token: str, from_redirect: bool = False) -> PathRef:
+    cleaned = token.rstrip(",;")
+    basename = cleaned.rsplit("/", 1)[-1]
+    extension = basename.rsplit(".", 1)[-1].lower() if "." in basename[1:] else ""
+    return PathRef(raw=cleaned, basename=basename, extension=extension, from_redirect=from_redirect)
+
+
+def _collect_paths(commands: Sequence[SimpleCommand]) -> List[PathRef]:
+    paths: List[PathRef] = []
+    seen: Set[str] = set()
+    for command in commands:
+        for token in command.argv[1:]:
+            candidate = token.split("=", 1)[1] if "=" in token and (
+                not token.startswith("-") or token.startswith("--")) else token
+            if looks_like_path(candidate) and candidate not in seen:
+                seen.add(candidate)
+                paths.append(make_path_ref(candidate))
+        for _op, target in command.redirects:
+            if target and target not in seen:
+                seen.add(target)
+                paths.append(make_path_ref(target, from_redirect=True))
+    return paths
 
 
 # --------------------------------------------------------------------------
@@ -245,162 +398,98 @@ def remote_payload(execution: Execution) -> Optional[str]:
 # --------------------------------------------------------------------------
 @dataclass
 class CommandContext:
-    """Everything the feature modules need about a single event."""
+    """Everything the feature groups need about a single command line."""
 
-    event: Event
     raw: str
-    lower: str
     parsed: ParsedCommand
     executions: List[Execution] = field(default_factory=list)
-    basenames: List[str] = field(default_factory=list)
     shell_payloads: List[str] = field(default_factory=list)
     script_payloads: List[str] = field(default_factory=list)
     remote_payloads: List[str] = field(default_factory=list)
-    all_words: List[str] = field(default_factory=list)
-    args: List[str] = field(default_factory=list)
-    paths: List[tu.PathRef] = field(default_factory=list)
-    urls: List[tu.UrlRef] = field(default_factory=list)
+    paths: List[PathRef] = field(default_factory=list)
+    urls: List[UrlRef] = field(default_factory=list)
     ipv4s: List[str] = field(default_factory=list)
     ipv6s: List[str] = field(default_factory=list)
-    domains: List[str] = field(default_factory=list)
     ports: List[int] = field(default_factory=list)
-    user_at_hosts: List[Tuple[str, str]] = field(default_factory=list)
-    scan_text: str = ""       # raw command plus payloads, for keyword scanning
+    scan_text: str = ""       # raw command plus inline script payloads, for keyword scanning
+    lower: str = ""           # scan_text, lower-cased
 
-    # -- convenience predicates -------------------------------------------
+    @property
+    def basenames(self) -> List[str]:
+        return [e.basename for e in self.executions]
+
     def uses(self, *names: str) -> bool:
         """True if any resolved executable basename matches one of ``names``."""
         wanted = set(names)
-        return any(base in wanted for base in self.basenames)
+        return any(e.basename in wanted for e in self.executions)
 
     def executions_of(self, *names: str) -> List[Execution]:
         wanted = set(names)
         return [e for e in self.executions if e.basename in wanted]
 
-    def count_uses(self, *names: str) -> int:
-        wanted = set(names)
-        return sum(1 for base in self.basenames if base in wanted)
+    def path_matches(self, *prefixes: str) -> List[PathRef]:
+        return [p for p in self.paths
+                if any(p.lowered == prefix.rstrip("/") or p.lowered.startswith(prefix) for prefix in prefixes)]
 
-    def any_wrapper(self, *names: str) -> bool:
-        wanted = set(names)
-        return any(w in wanted for e in self.executions for w in e.wrappers)
-
-    def text_contains(self, *needles: str) -> bool:
-        return any(needle in self.scan_text for needle in needles)
-
-    def path_matches(self, *prefixes: str) -> List[tu.PathRef]:
-        out = []
-        for path in self.paths:
-            low = path.lowered
-            if any(low == p.rstrip("/") or low.startswith(p) for p in prefixes):
-                out.append(path)
-        return out
-
-    def basename_matches(self, *names: str) -> List[tu.PathRef]:
+    def basename_matches(self, *names: str) -> List[PathRef]:
         wanted = set(names)
         return [p for p in self.paths if p.basename.lower() in wanted]
 
 
-def _collect_paths(commands: Sequence[SimpleCommand]) -> List[tu.PathRef]:
-    paths: List[tu.PathRef] = []
-    seen: Set[str] = set()
-    for command in commands:
-        for token in command.argv[1:] if command.argv else []:
-            candidates: List[str] = []
-            if "=" in token and not token.startswith("-"):
-                candidates.append(token.split("=", 1)[1])
-            elif token.startswith("--") and "=" in token:
-                candidates.append(token.split("=", 1)[1])
-            else:
-                candidates.append(token)
-            for candidate in candidates:
-                if tu.looks_like_path(candidate) and candidate not in seen:
-                    seen.add(candidate)
-                    paths.append(tu.make_path_ref(candidate))
-        for _op, target in command.redirects:
-            if target and target not in seen:
-                seen.add(target)
-                paths.append(tu.make_path_ref(target, from_redirect=True))
-    return paths
-
-
-def build_context(event: Event) -> CommandContext:
-    """Lex and analyse one event into a :class:`CommandContext`."""
-    raw = event.command or ""
-    parsed = tokenize(raw)
+def build_context(command: str) -> CommandContext:
+    """Lex and analyse one command line into a :class:`CommandContext`."""
+    parsed = tokenize(command)
 
     executions: List[Execution] = []
     shell_payloads: List[str] = []
     script_payloads: List[str] = []
     remote_payloads: List[str] = []
 
-    def absorb(commands: Sequence[SimpleCommand], nested: bool) -> None:
-        for command in commands:
-            execution = resolve_execution(command, nested=nested)
+    def absorb(commands: Sequence[SimpleCommand]) -> None:
+        for simple in commands:
+            execution = resolve_execution(simple)
             if execution is None:
                 continue
             executions.append(execution)
             payload = inline_payload(execution)
             if payload:
-                if execution.basename in SHELLS:
-                    shell_payloads.append(payload)
-                else:
-                    script_payloads.append(payload)
+                (shell_payloads if execution.basename in SHELLS else script_payloads).append(payload)
             remote = remote_payload(execution)
             if remote:
                 remote_payloads.append(remote)
 
-    absorb(parsed.commands, nested=False)
+    absorb(parsed.commands)
 
     # one level of descent: substitutions, shell -c payloads, remote commands
-    nested_texts: List[str] = list(parsed.substitutions) + list(shell_payloads) + list(remote_payloads)
     nested_commands: List[SimpleCommand] = []
-    for text in nested_texts:
-        if not text or not text.strip():
-            continue
-        sub = tokenize(text)
-        for command in sub.commands:
-            command.from_substitution = True
-        nested_commands.extend(sub.commands)
-    absorb(nested_commands, nested=True)
+    for text in list(parsed.substitutions) + shell_payloads + remote_payloads:
+        if text and text.strip():
+            nested_commands.extend(tokenize(text).commands)
+    absorb(nested_commands)
 
-    all_commands: List[SimpleCommand] = list(parsed.commands) + nested_commands
-    all_words = [w for command in all_commands for w in command.argv]
-    args = [w for command in all_commands for w in command.argv[1:]]
+    all_commands = list(parsed.commands) + nested_commands
+    scan_text = "\n".join([command] + script_payloads)
 
-    scan_text = "\n".join([raw] + script_payloads)
-    lower = scan_text.lower()
-
-    urls = tu.extract_urls(scan_text)
-    ipv4s = tu.extract_ipv4(scan_text)
-    ipv6s = tu.extract_ipv6(scan_text)
-    domains = tu.extract_domains(scan_text, [u.host for u in urls])
-    ports = tu.extract_ports(scan_text, urls, [c.argv for c in all_commands])
+    urls = extract_urls(scan_text)
+    ports = extract_ports(scan_text, urls, [c.argv for c in all_commands])
     for execution in executions:
         if execution.basename in PORT_POSITIONAL_TOOLS:
             for token in execution.positionals:
                 if token.isdigit() and 0 < int(token) <= 65535:
                     ports.append(int(token))
-    user_at_hosts = [(m.group(1), m.group(2)) for m in tu.USER_AT_HOST_RE.finditer(scan_text)]
 
     return CommandContext(
-        event=event,
-        raw=raw,
-        lower=lower,
+        raw=command,
         parsed=parsed,
         executions=executions,
-        basenames=[e.basename for e in executions],
         shell_payloads=shell_payloads,
         script_payloads=script_payloads,
         remote_payloads=remote_payloads,
-        all_words=all_words,
-        args=args,
         paths=_collect_paths(all_commands),
         urls=urls,
-        ipv4s=ipv4s,
-        ipv6s=ipv6s,
-        domains=domains,
+        ipv4s=extract_ipv4(scan_text),
+        ipv6s=extract_ipv6(scan_text),
         ports=sorted(set(ports)),
-        user_at_hosts=user_at_hosts,
         scan_text=scan_text,
+        lower=scan_text.lower(),
     )

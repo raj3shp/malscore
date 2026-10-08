@@ -5,7 +5,7 @@ from __future__ import annotations
 import unittest
 
 import _bootstrap  # noqa: F401
-from cmdfeat.script import looks_like_script, split_script
+from malscore.script import looks_like_script, split_script
 
 
 class ScriptSplitTest(unittest.TestCase):

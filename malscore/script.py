@@ -1,8 +1,8 @@
 """Split a shell script into logical statements, without executing anything.
 
-Telemetry delivers one command line per event; a script is many of them.  This
-module turns script text into :class:`Statement` objects that look like the
-command lines the feature extractors already understand:
+A script is many command lines.  This module turns script text into
+:class:`Statement` objects that look like the single command lines the feature
+extractor understands:
 
 * ``#`` comments (including the shebang) are dropped;
 * backslash-newline continuations, trailing ``|`` / ``&&`` / ``||`` and quotes
@@ -10,7 +10,7 @@ command lines the feature extractors already understand:
 * here-document bodies are kept *apart* from the command that consumes them,
   so ``cat > unit.service <<EOF`` does not turn the unit file's lines into
   commands -- the scorer decides what the body means (see
-  :func:`cmdfeat.scoring.engine.assess_script`).
+  :meth:`malscore.scoring.Analyzer.assess_script`).
 
 Like the lexer, the splitter is approximate and never raises.
 """
@@ -41,7 +41,6 @@ class Statement:
 
     text: str
     line: int                    # 1-based first line
-    end_line: int
     heredocs: List[Heredoc] = field(default_factory=list)
 
 
@@ -101,12 +100,11 @@ def split_script(text: str, first_line: int = 1) -> List[Statement]:
     pending: List[Heredoc] = []
     index = 0
 
-    def flush(end_index: int) -> None:
+    def flush() -> None:
         nonlocal buffer, start, pending
         joined = "".join(buffer).strip()
         if joined:
-            statements.append(Statement(text=joined, line=start or first_line,
-                                        end_line=end_index + first_line, heredocs=pending))
+            statements.append(Statement(text=joined, line=start or first_line, heredocs=pending))
         buffer, start, pending = [], None, []
 
     while index < len(lines):
@@ -144,7 +142,7 @@ def split_script(text: str, first_line: int = 1) -> List[Statement]:
             heredoc.body = "\n".join(body)
             consumed = cursor
         if consumed != index:
-            flush(consumed)
+            flush()
             index = consumed + 1
             continue
 
@@ -152,11 +150,11 @@ def split_script(text: str, first_line: int = 1) -> List[Statement]:
             buffer.append(" ")
             index += 1
             continue
-        flush(index)
+        flush()
         index += 1
 
     if buffer:
-        flush(len(lines) - 1)
+        flush()
     return statements
 
 

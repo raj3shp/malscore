@@ -16,8 +16,7 @@ import unittest
 from typing import List
 
 import _bootstrap  # noqa: F401
-from cmdfeat.events import Event
-from cmdfeat.pipeline import ExtractorConfig, FeatureExtractor
+from malscore import Analyzer
 
 ROOT = _bootstrap.ROOT
 FORBIDDEN = [
@@ -59,20 +58,20 @@ class StaticSafetyTest(unittest.TestCase):
         self.assertEqual(offenders, [], "execution primitives found: %s" % offenders)
 
     def test_scans_a_meaningful_number_of_files(self) -> None:
-        self.assertGreater(len(source_files()), 20)
+        self.assertGreater(len(source_files()), 10)
 
 
 class RuntimeSafetyTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.extractor = FeatureExtractor(ExtractorConfig())
-        self.tmpdir = tempfile.mkdtemp(prefix="cmdfeat-safety-")
+        self.analyzer = Analyzer()
+        self.tmpdir = tempfile.mkdtemp(prefix="malscore-safety-")
 
     def test_analysis_creates_nothing(self) -> None:
         target = os.path.join(self.tmpdir, "created.txt")
         directory = os.path.join(self.tmpdir, "created_dir")
         for command in ("touch %s" % target, "mkdir -p %s" % directory,
                         "echo hi > %s" % target, "curl -o %s http://127.0.0.1/x" % target):
-            self.extractor.extract_event(Event(0, 1, command=command, user="t"))
+            self.analyzer.assess(command)
         self.assertFalse(os.path.exists(target))
         self.assertFalse(os.path.exists(directory))
 
@@ -82,18 +81,21 @@ class RuntimeSafetyTest(unittest.TestCase):
             handle.write("data")
         for command in ("rm -rf %s" % victim, "shred -u %s" % victim,
                         "truncate -s 0 %s" % victim, "dd if=/dev/zero of=%s" % victim):
-            self.extractor.extract_event(Event(0, 1, command=command, user="t"))
+            self.analyzer.assess(command)
         self.assertTrue(os.path.exists(victim))
         with open(victim, "r", encoding="utf-8") as handle:
             self.assertEqual(handle.read(), "data")
 
     def test_substitutions_are_not_evaluated(self) -> None:
         marker = os.path.join(self.tmpdir, "subst.txt")
-        record = self.extractor.extract_event(
-            Event(0, 1, command="echo $(touch %s) `mkdir %s.d`" % (marker, marker), user="t")
-        )
+        self.analyzer.assess("echo $(touch %s) `mkdir %s.d`" % (marker, marker))
         self.assertFalse(os.path.exists(marker))
-        self.assertTrue(record["has_command_substitution"])
+        self.assertFalse(os.path.exists(marker + ".d"))
+
+    def test_scripts_and_heredocs_are_not_run(self) -> None:
+        marker = os.path.join(self.tmpdir, "script.txt")
+        self.analyzer.assess("#!/bin/sh\ntouch %s\nbash <<SH\ntouch %s\nSH\n" % (marker, marker))
+        self.assertFalse(os.path.exists(marker))
 
     def tearDown(self) -> None:
         for name in os.listdir(self.tmpdir):

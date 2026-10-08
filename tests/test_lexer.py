@@ -5,7 +5,7 @@ from __future__ import annotations
 import unittest
 
 import _bootstrap  # noqa: F401
-from cmdfeat.lexer import tokenize
+from malscore.lexer import tokenize
 
 
 class TokenizeTest(unittest.TestCase):
@@ -25,25 +25,21 @@ class TokenizeTest(unittest.TestCase):
     def test_single_quotes_keep_metacharacters(self) -> None:
         parsed = tokenize("python3 -c 'import os; print(1)'")
         self.assertEqual(parsed.commands[0].argv, ["python3", "-c", "import os; print(1)"])
-        self.assertEqual(parsed.single_quote_count, 1)
 
     def test_double_quotes_and_expansion(self) -> None:
         parsed = tokenize('echo "${HOME}/a b"')
         self.assertEqual(parsed.commands[0].argv, ["echo", "${HOME}/a b"])
-        self.assertEqual(parsed.double_quote_count, 1)
-        self.assertGreaterEqual(parsed.expansion_count, 1)
 
     def test_pipeline_stages(self) -> None:
         parsed = tokenize("cat a | grep b | wc -l")
         self.assertEqual(len(parsed.commands), 3)
-        self.assertEqual(parsed.max_pipeline_length, 3)
         self.assertEqual([c.pipeline_index for c in parsed.commands], [0, 1, 2])
+        self.assertEqual({c.pipeline_length for c in parsed.commands}, {3})
 
     def test_logical_operators_start_new_pipeline(self) -> None:
         parsed = tokenize("make build && make test")
         self.assertEqual(len(parsed.commands), 2)
-        self.assertEqual(parsed.commands[1].preceding_op, "&&")
-        self.assertEqual(parsed.max_pipeline_length, 1)
+        self.assertNotEqual(parsed.commands[0].pipeline_id, parsed.commands[1].pipeline_id)
 
     def test_redirections_are_not_arguments(self) -> None:
         parsed = tokenize("echo hi > /tmp/out 2>&1")
@@ -61,18 +57,13 @@ class TokenizeTest(unittest.TestCase):
     def test_command_substitution_captured(self) -> None:
         parsed = tokenize("echo $(whoami) `date`")
         self.assertEqual(parsed.substitutions, ["whoami", "date"])
-        self.assertEqual(parsed.dollar_paren_count, 1)
-        self.assertEqual(parsed.backtick_count, 1)
 
     def test_subshell_and_background(self) -> None:
         parsed = tokenize("(cd /tmp && ls) &")
-        self.assertIn("(", parsed.operators)
-        self.assertIn("&", parsed.operators)
-        self.assertGreaterEqual(parsed.max_subshell_depth, 1)
+        self.assertEqual([c.argv for c in parsed.commands], [["cd", "/tmp"], ["ls"]])
 
     def test_unterminated_quote_does_not_raise(self) -> None:
         parsed = tokenize("echo 'unterminated")
-        self.assertTrue(parsed.unbalanced_quotes)
         self.assertEqual(parsed.commands[0].argv, ["echo", "unterminated"])
 
     def test_malformed_operators_do_not_raise(self) -> None:
@@ -83,9 +74,13 @@ class TokenizeTest(unittest.TestCase):
         parsed = tokenize("echo a\x00b")
         self.assertIn("\x00", parsed.raw)
 
-    def test_escapes_counted(self) -> None:
+    def test_escaped_space_stays_in_word(self) -> None:
         parsed = tokenize(r"grep -r foo\ bar /etc")
-        self.assertGreaterEqual(parsed.escape_count, 1)
+        self.assertEqual(parsed.commands[0].argv, ["grep", "-r", "foo bar", "/etc"])
+
+    def test_quoted_words_are_marked(self) -> None:
+        parsed = tokenize("echo 'a b' c")
+        self.assertEqual([t.quoted for t in parsed.tokens if t.kind == "word"], [False, True, False])
 
 
 if __name__ == "__main__":

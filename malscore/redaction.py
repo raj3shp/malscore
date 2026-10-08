@@ -1,12 +1,9 @@
-"""Optional redaction of secret-looking values (section 31 of the spec).
+"""Redaction of secret-looking values in echoed command text.
 
-Command lines routinely carry passwords, tokens and keys.  When
-``--redact-secrets`` is on, those *values* are replaced before anything is
-written out, while the structure that features depend on is preserved: the
-option name, the number of arguments and the command shape all survive.
-
-Feature extraction always runs on the original text, so redaction never changes
-the numbers -- only what is stored.
+Command lines routinely carry passwords, tokens and keys.  With ``--redact``,
+those *values* are replaced before any command is printed, while the option
+name and the command shape survive.  Scoring always runs on the original text,
+so redaction never changes a score -- only what is shown.
 """
 
 from __future__ import annotations
@@ -34,7 +31,7 @@ BLOB_RE = re.compile(r"(?<![\w/+=])(?=[A-Za-z0-9+/]*[0-9])(?=[A-Za-z0-9+/]*[A-Z]
                      r"[A-Za-z0-9+/]{32,}={0,2}(?![\w/+=])")
 
 
-def redact(text: str, redact_blobs: bool = True) -> str:
+def redact(text: str) -> str:
     """Return ``text`` with credential-looking values replaced."""
     if not text:
         return text
@@ -44,6 +41,4 @@ def redact(text: str, redact_blobs: bool = True) -> str:
             redacted = pattern.sub(lambda m: m.group(1) + REDACTED + m.group(3), redacted)
         else:
             redacted = pattern.sub(lambda m: m.group(1) + REDACTED, redacted)
-    if redact_blobs:
-        redacted = BLOB_RE.sub(REDACTED, redacted)
-    return redacted
+    return BLOB_RE.sub(REDACTED, redacted)

