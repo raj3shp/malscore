@@ -14,12 +14,11 @@ dominates, and the result stays in ``[0, 1)`` before being scaled to 0-100.
 Signals within the same tactic are damped (a command that trips three redundant
 persistence checks should not score as if it did three independent things).
 
-``Analyzer.assess_command`` scores one command line.  ``assess_script`` splits a
-script into statements, scores each, and then looks for *cross-statement*
-patterns that no single line reveals -- a file downloaded on line 3 and executed
-on line 40, a ``tar`` on line 10 whose archive is ``scp``-ed on line 12,
-credential access followed later by an upload.  ``assess`` picks between them by
-shape.
+``Analyzer.assess_command`` scores one command line.  ``assess_session`` scores a
+list of commands, then looks for *cross-command* patterns that no single command
+reveals -- a file downloaded by one command and executed by a later one, a
+``tar`` whose archive is ``scp``-ed afterwards, credential access followed later
+by an upload.
 """
 
 from __future__ import annotations
@@ -29,8 +28,7 @@ from typing import Dict, List, Sequence, Tuple
 
 from .features import Record, extract_features
 from .redaction import redact
-from .script import Statement, looks_like_script, split_script
-from .signals import SCRIPT_SIGNALS, SIGNALS, Signal, on
+from .signals import SESSION_SIGNALS, SIGNALS, Signal, on
 
 #: Score bands for the verdict label.  Lower bound inclusive.
 BANDS: Tuple[Tuple[int, str], ...] = (
@@ -43,14 +41,14 @@ BANDS: Tuple[Tuple[int, str], ...] = (
 VERDICTS = [label for _lower, label in reversed(BANDS)]
 #: Within one tactic, the n-th strongest signal is multiplied by DAMPING**n.
 TACTIC_DAMPING = 0.55
-#: Script-level combination caps the contribution of any single noisy statement,
-#: so a 200-line script is not automatically "critical" because one line is.
-STATEMENT_CONTRIBUTION = 0.9
+#: Session-level combination caps the contribution of any single noisy command,
+#: so a 200-command session is not automatically "critical" because one command is.
+COMMAND_CONTRIBUTION = 0.9
 
 
 @dataclass
 class Assessment:
-    """The result of scoring one command or one script."""
+    """The result of scoring one command or one session."""
 
     score: int
     verdict: str
@@ -58,10 +56,10 @@ class Assessment:
     command: str = ""
     tactics: List[str] = field(default_factory=list)
     techniques: List[str] = field(default_factory=list)
-    per_statement: List["Assessment"] = field(default_factory=list)
+    per_command: List["Assessment"] = field(default_factory=list)
     line: int = 0
 
-    def as_dict(self, include_statements: bool = True) -> Dict[str, object]:
+    def as_dict(self, include_commands: bool = True) -> Dict[str, object]:
         data: Dict[str, object] = {
             "score": self.score,
             "verdict": self.verdict,
@@ -82,8 +80,8 @@ class Assessment:
             data["command"] = self.command
         if self.line:
             data["line"] = self.line
-        if include_statements and self.per_statement:
-            data["statements"] = [s.as_dict(include_statements=False) for s in self.per_statement]
+        if include_commands and self.per_command:
+            data["commands"] = [c.as_dict(include_commands=False) for c in self.per_command]
         return data
 
 
@@ -153,7 +151,7 @@ def score_record(record: Record, command: str = "", line: int = 0) -> Assessment
 
 
 class Analyzer:
-    """Scores commands and scripts.
+    """Scores single commands and sessions of commands.
 
     With ``redact=True``, credential-looking values are replaced in every
     command echoed back in an :class:`Assessment`; scoring always sees the
@@ -166,80 +164,46 @@ class Analyzer:
     def _echo(self, command: str) -> str:
         return redact(command) if self.redact else command
 
-    # -- single command --------------------------------------------------------
     def assess_command(self, command: str, line: int = 0) -> Assessment:
+        """Score one command line."""
         return score_record(extract_features(command), command=self._echo(command), line=line)
 
-    # -- script ----------------------------------------------------------------
-    def assess_script(self, text: str) -> Assessment:
-        statements = split_script(text)
-        per_statement: List[Assessment] = []
-        records: List[Record] = []
-        for statement in statements:
-            record = extract_features(statement.text)
-            records.append(record)
-            assessment = score_record(record, command=self._echo(statement.text), line=statement.line)
-            self._fold_heredocs(statement, record, assessment)
-            per_statement.append(assessment)
+    def assess_session(self, commands: Sequence[str]) -> Assessment:
+        """Score a list of commands run in order, such as a shell history.
 
-        cross = _cross_statement_hits(statements, records, per_statement)
-        statement_weights = [_combine(_damped_weights(a.hits)) * STATEMENT_CONTRIBUTION
-                             for a in per_statement]
-        score = int(round(_combine(statement_weights + [hit.weight for hit in cross]) * 100))
+        Blank entries are skipped; each command's ``line`` is its 1-based
+        position in ``commands``.
+        """
+        session = [(line, command.strip()) for line, command in enumerate(commands, start=1) if command.strip()]
+        records: List[Record] = []
+        per_command: List[Assessment] = []
+        for line, command in session:
+            record = extract_features(command)
+            records.append(record)
+            per_command.append(score_record(record, command=self._echo(command), line=line))
+
+        cross = _session_hits([command for _line, command in session], records, per_command)
+        command_weights = [_combine(_damped_weights(a.hits)) * COMMAND_CONTRIBUTION for a in per_command]
+        score = int(round(_combine(command_weights + [hit.weight for hit in cross]) * 100))
 
         # de-duplicate for the tactic/technique roll-up, keep strongest first
         unique: Dict[str, Signal] = {}
-        for hit in sorted([h for a in per_statement for h in a.hits] + cross,
+        for hit in sorted([h for a in per_command for h in a.hits] + cross,
                           key=lambda h: h.weight, reverse=True):
             unique.setdefault(hit.id, hit)
         ranked = list(unique.values())
         tactics, techniques = _collect(ranked)
 
         return Assessment(score=score, verdict=verdict_for(score), hits=ranked,
-                          tactics=tactics, techniques=techniques, per_statement=per_statement)
-
-    # -- dispatch --------------------------------------------------------------
-    def assess(self, text: str) -> Assessment:
-        return self.assess_script(text) if looks_like_script(text) else self.assess_command(text.strip())
-
-    def _fold_heredocs(self, statement: Statement, record: Record, assessment: Assessment) -> None:
-        """Score here-doc bodies fed to an interpreter as part of this statement.
-
-        ``bash <<SH ... SH`` and ``python3 - <<PY ... PY`` carry their real
-        payload in the body, not in ``statement.text``.  Each body is scored on
-        its own and its signals are merged into the statement, so the payload is
-        not invisible to the scorer.  Bodies written to a file (``cat > unit
-        <<EOF``) need no folding: the redirect target already trips the relevant
-        path/persistence features.
-        """
-        fed_to_interpreter = bool(
-            record.get("stdin_script_execution")
-            or (record.get("interpreter_used") and statement.text.rstrip().endswith(("-", "<<", "SH", "EOF", "PY")))
-            or any(base in statement.text.split() for base in ("bash", "sh", "python", "python3", "perl", "ruby"))
-        )
-        if not fed_to_interpreter:
-            return
-        merged: Dict[str, Signal] = {hit.id: hit for hit in assessment.hits}
-        for heredoc in statement.heredocs:
-            body = heredoc.body.strip()
-            if not body:
-                continue
-            sub = self.assess_script(body) if "\n" in body else self.assess_command(body)
-            for hit in sub.hits:
-                merged.setdefault(hit.id, hit)
-        if len(merged) != len(assessment.hits):
-            assessment.hits = sorted(merged.values(), key=lambda h: h.weight, reverse=True)
-            assessment.score = _score(assessment.hits)
-            assessment.verdict = verdict_for(assessment.score)
-            assessment.tactics, assessment.techniques = _collect(assessment.hits)
+                          tactics=tactics, techniques=techniques, per_command=per_command)
 
 
 # --------------------------------------------------------------------------
-# cross-statement analysis
+# cross-command analysis
 # --------------------------------------------------------------------------
-def _cross_statement_hits(statements: Sequence[Statement], records: Sequence[Record],
-                          per_statement: Sequence[Assessment]) -> List[Signal]:
-    """Find patterns that only appear across multiple statements."""
+def _session_hits(commands: Sequence[str], records: Sequence[Record],
+                  per_command: Sequence[Assessment]) -> List[Signal]:
+    """Find patterns that only appear across multiple commands."""
     downloaded_paths: List[Tuple[int, str]] = []
     archive_paths: List[Tuple[int, str]] = []
     executed_after_download = False
@@ -248,8 +212,7 @@ def _cross_statement_hits(statements: Sequence[Statement], records: Sequence[Rec
     upload_after_cred = False
     has_download = has_persistence = False
 
-    for index, (statement, record) in enumerate(zip(statements, records)):
-        command = statement.text
+    for index, (command, record) in enumerate(zip(commands, records)):
         path = str(record.get("download_output_path", "") or "")
         if path:
             downloaded_paths.append((index, path.rstrip("/")))
@@ -261,7 +224,7 @@ def _cross_statement_hits(statements: Sequence[Statement], records: Sequence[Rec
               "shell_startup_write", "preload_persistence", "service_enable"):
             has_persistence = True
 
-        # a later statement executes a path a former one downloaded
+        # a later command executes a path an earlier one downloaded
         for prior_index, prior_path in downloaded_paths:
             base = prior_path.rsplit("/", 1)[-1]
             if prior_index < index and base and (base in command or prior_path in command):
@@ -269,7 +232,7 @@ def _cross_statement_hits(statements: Sequence[Statement], records: Sequence[Rec
                         or command.strip().startswith(("./", "/", "sh ", "bash ")):
                     executed_after_download = True
 
-        # a later statement sends an archive a former one created
+        # a later command sends an archive an earlier one created
         if on(record, "upload_indicator", "network_upload", "remote_copy", "transfer_over_socket_tool"):
             for prior_index, prior_path in archive_paths:
                 base = prior_path.rsplit("/", 1)[-1]
@@ -288,21 +251,21 @@ def _cross_statement_hits(statements: Sequence[Statement], records: Sequence[Rec
 
     # cover-tracks: history/log clearing after earlier substantive activity
     cleared_tracks_after = any(
-        on(record, "history_cleared", "log_tampering") and any(a.score >= 15 for a in per_statement[:index])
+        on(record, "history_cleared", "log_tampering") and any(a.score >= 15 for a in per_command[:index])
         for index, record in enumerate(records))
-    tactics_seen = {t for a in per_statement for t in a.tactics if t != "discovery"}
+    tactics_seen = {t for a in per_command for t in a.tactics if t != "discovery"}
 
     hits: List[Signal] = []
     if executed_after_download:
-        hits.append(SCRIPT_SIGNALS["staged_download_execution"])
+        hits.append(SESSION_SIGNALS["staged_download_execution"])
     if archive_then_network:
-        hits.append(SCRIPT_SIGNALS["collect_then_exfiltrate"])
+        hits.append(SESSION_SIGNALS["collect_then_exfiltrate"])
     if upload_after_cred:
-        hits.append(SCRIPT_SIGNALS["credential_access_then_upload"])
+        hits.append(SESSION_SIGNALS["credential_access_then_upload"])
     if has_download and has_persistence:
-        hits.append(SCRIPT_SIGNALS["download_and_persist"])
+        hits.append(SESSION_SIGNALS["download_and_persist"])
     if cleared_tracks_after:
-        hits.append(SCRIPT_SIGNALS["cover_tracks"])
+        hits.append(SESSION_SIGNALS["cover_tracks"])
     if len(tactics_seen) >= 3:
-        hits.append(SCRIPT_SIGNALS["multi_stage"])
+        hits.append(SESSION_SIGNALS["multi_stage"])
     return hits

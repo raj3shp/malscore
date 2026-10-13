@@ -71,7 +71,7 @@ class RuntimeSafetyTest(unittest.TestCase):
         directory = os.path.join(self.tmpdir, "created_dir")
         for command in ("touch %s" % target, "mkdir -p %s" % directory,
                         "echo hi > %s" % target, "curl -o %s http://127.0.0.1/x" % target):
-            self.analyzer.assess(command)
+            self.analyzer.assess_command(command)
         self.assertFalse(os.path.exists(target))
         self.assertFalse(os.path.exists(directory))
 
@@ -81,21 +81,21 @@ class RuntimeSafetyTest(unittest.TestCase):
             handle.write("data")
         for command in ("rm -rf %s" % victim, "shred -u %s" % victim,
                         "truncate -s 0 %s" % victim, "dd if=/dev/zero of=%s" % victim):
-            self.analyzer.assess(command)
+            self.analyzer.assess_command(command)
         self.assertTrue(os.path.exists(victim))
         with open(victim, "r", encoding="utf-8") as handle:
             self.assertEqual(handle.read(), "data")
 
     def test_substitutions_are_not_evaluated(self) -> None:
         marker = os.path.join(self.tmpdir, "subst.txt")
-        self.analyzer.assess("echo $(touch %s) `mkdir %s.d`" % (marker, marker))
+        self.analyzer.assess_command("echo $(touch %s) `mkdir %s.d`" % (marker, marker))
         self.assertFalse(os.path.exists(marker))
         self.assertFalse(os.path.exists(marker + ".d"))
 
-    def test_scripts_and_heredocs_are_not_run(self) -> None:
-        marker = os.path.join(self.tmpdir, "script.txt")
-        self.analyzer.assess("#!/bin/sh\ntouch %s\nbash <<SH\ntouch %s\nSH\n" % (marker, marker))
-        self.assertFalse(os.path.exists(marker))
+    def test_sessions_are_not_run(self) -> None:
+        marker = os.path.join(self.tmpdir, "session.txt")
+        self.analyzer.assess_session(["touch %s" % marker, "mkdir %s.d" % marker, "bash -c 'touch %s'" % marker])
+        self.assertEqual(os.listdir(self.tmpdir), [])
 
     def tearDown(self) -> None:
         for name in os.listdir(self.tmpdir):

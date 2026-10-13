@@ -4,7 +4,7 @@ Each group function (``chains``, ``network``, ``tradecraft``, ...) takes a
 :class:`~malscore.context.CommandContext` and returns named features.  A feature
 is an observation ("a ``/dev/tcp`` redirection is present", "a download is
 piped into a shell"), never a verdict -- weighing observations is the job of
-:mod:`malscore.signals`.  Only features that some signal or the script analysis
+:mod:`malscore.signals`.  Only features that some signal or the session analysis
 reads are computed.
 
 Nothing here executes, expands or resolves anything.
@@ -414,16 +414,13 @@ def _is_script_file(token: str) -> bool:
 
 
 def executables(ctx: CommandContext) -> Record:
-    """How code is run: interpreters, scripts by path, programs read from stdin."""
+    """How code is run: interpreters and scripts executed by path."""
     interpreters = [e for e in ctx.executions if e.basename in INTERPRETERS]
     return {
         "interpreter_used": int(bool(interpreters)),
         "script_path_execution": int(any(
             _is_script_file(e.name) and ("/" in e.name or e.name.startswith("."))
             for e in ctx.executions)),
-        "stdin_script_execution": int(any(
-            op.endswith("<") for e in interpreters if e.command is not None
-            for op, _target in e.command.redirects)),
     }
 
 
@@ -1022,7 +1019,7 @@ def extract_features(command: str) -> Record:
     """Compute every feature for one command line.
 
     A group that raises on some odd input is skipped -- its features read as
-    unset -- so one malformed command line never aborts a script or a feed.
+    unset -- so one malformed command line never aborts a session or a feed.
     """
     ctx = build_context(command[:MAX_COMMAND_LENGTH])
     record: Record = {}

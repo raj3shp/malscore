@@ -354,17 +354,17 @@ if len({signal.id for signal in SIGNALS}) != len(SIGNALS):    # pragma: no cover
     raise ValueError("duplicate signal id in catalogue")
 
 
-# -- signals that only exist across several statements of a script ---------------
-SCRIPT_SIGNALS: Dict[str, Signal] = {
+# -- signals that only exist across several commands of a session ----------------
+SESSION_SIGNALS: Dict[str, Signal] = {
     s.id: s for s in [
-        # fired by the cross-statement analysis in malscore.scoring, never by a record
-        _s("staged_download_execution", "A file downloaded earlier in the script is executed later", 0.55,
+        # fired by the session analysis in malscore.scoring, never by a single record
+        _s("staged_download_execution", "A file downloaded earlier in the session is executed later", 0.55,
            EXECUTION, ("T1105", "T1204.002")),
-        _s("collect_then_exfiltrate", "An archive created in the script is later sent over the network", 0.5,
+        _s("collect_then_exfiltrate", "An archive created in the session is later sent over the network", 0.5,
            EXFILTRATION, ("T1560.001", "T1041")),
         _s("credential_access_then_upload", "Credential access is followed by an outbound transfer", 0.4,
            EXFILTRATION, ("T1552", "T1041")),
-        _s("download_and_persist", "The script both fetches remote content and installs persistence", 0.3,
+        _s("download_and_persist", "The session both fetches remote content and installs persistence", 0.3,
            PERSISTENCE, ("T1105", "T1543")),
         _s("cover_tracks", "Activity is followed by clearing history or logs", 0.3,
            DEFENSE_EVASION, ("T1070",)),
