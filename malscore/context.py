@@ -67,6 +67,10 @@ PREFIX_KEYWORDS = frozenset({"if", "then", "else", "elif", "do", "while", "until
 #: Reserved words that start or end a construct rather than run a program.
 NON_EXECUTING_KEYWORDS = frozenset({"for", "case", "select", "function", "in",
                                     "fi", "done", "esac", "}"})
+TEMP_DIRS = ("/tmp", "/var/tmp", "/dev/shm")
+TEMP_PREFIXES = tuple(d + "/" for d in TEMP_DIRS)
+#: Redirect targets that discard or pass through output rather than write a file.
+DISCARD_TARGETS = frozenset({"/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty"})
 #: Tools that take a bare port number as a positional argument (nc host 4444).
 PORT_POSITIONAL_TOOLS = frozenset({"nc", "ncat", "netcat", "telnet", "socat", "tftp", "rsh"})
 
@@ -493,3 +497,53 @@ def build_context(command: str) -> CommandContext:
         scan_text=scan_text,
         lower=scan_text.lower(),
     )
+
+
+# --------------------------------------------------------------------------
+# helpers shared by the feature groups
+# --------------------------------------------------------------------------
+def all_commands(ctx: CommandContext) -> List[SimpleCommand]:
+    """Top-level and nested simple commands, each once."""
+    seen = set()
+    out: List[SimpleCommand] = []
+    for command in list(ctx.parsed.commands) + [e.command for e in ctx.executions if e.command]:
+        if id(command) not in seen:
+            seen.add(id(command))
+            out.append(command)
+    return out
+
+
+def write_targets(ctx: CommandContext) -> List[str]:
+    """Paths this command line writes to: redirects, tee, dd of=, sed -i, cp/mv/install dest."""
+    targets: List[str] = []
+    for command in all_commands(ctx):
+        for op, target in command.redirects:
+            if target and op.endswith(">") and target not in DISCARD_TARGETS:
+                targets.append(target)
+    for execution in ctx.executions:
+        base = execution.basename
+        positionals = execution.positionals
+        if base == "tee":
+            targets.extend(positionals)
+        elif base == "dd":
+            targets.extend(a.split("=", 1)[1] for a in execution.args if a.startswith("of="))
+        elif base in ("sed", "perl") and any(a == "-i" or a.startswith("-i") and len(a) <= 6
+                                             or a.startswith("--in-place") for a in execution.args):
+            targets.extend(positionals[1:] if base == "sed" else positionals[-1:])
+        elif base in ("cp", "mv", "install", "ln", "rsync") and len(positionals) >= 2:
+            targets.append(positionals[-1])
+        elif base in ("truncate", "shred"):
+            targets.extend(positionals)
+    return targets
+
+
+def path_has_prefix(path: str, prefixes: Iterable[str]) -> bool:
+    """True when ``path`` equals or starts with one of ``prefixes`` (case-insensitive)."""
+    low = path.lower()
+    return any(low == p.rstrip("/") or low.startswith(p) for p in prefixes)
+
+
+def has_flag(args: List[str], *names: str) -> bool:
+    """True when any of ``names`` is given, alone or inside a short-option cluster."""
+    letters = flag_letters(args)
+    return any(a in names for a in args) or any(n in letters for n in names)

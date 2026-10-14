@@ -204,24 +204,39 @@ class Analyzer:
 def _session_hits(commands: Sequence[str], records: Sequence[Record],
                   per_command: Sequence[Assessment]) -> List[Signal]:
     """Find patterns that only appear across multiple commands."""
+    TRANSFER = ("upload_indicator", "network_upload", "remote_copy", "transfer_over_socket_tool")
+    ESCALATION = ("interactive_root_shell", "shell_as_other_user", "sudo_list_permissions",
+                  "privileged_shell_escape", "shell_escape")
+    CREDENTIAL = ("touches_shadow", "private_key_file_access", "cloud_credential_reference",
+                  "credential_search", "credential_keyword_search", "credential_file_reference",
+                  "credential_file_read", "environment_secret_read", "shell_history_read",
+                  "secret_pattern_search", "ssh_agent_hijack")
+
     downloaded_paths: List[Tuple[int, str]] = []
-    archive_paths: List[Tuple[int, str]] = []
+    staged_paths: List[Tuple[int, str]] = []       # (index, basename) of data written to disk
+    sent_basenames: List[str] = []                 # basenames referenced by a transfer command
     executed_after_download = False
-    archive_then_network = False
-    cred_index = None
-    upload_after_cred = False
+    staged_then_network = False
+    cleanup_after_exfil = False
+    cred_index = escalation_index = None
+    upload_after_cred = escalation_then_cred = False
     has_download = has_persistence = False
+
+    def basenames(paths: str) -> List[str]:
+        return [p.rsplit("/", 1)[-1] for p in paths.split("\n") if p.strip()]
 
     for index, (command, record) in enumerate(zip(commands, records)):
         path = str(record.get("download_output_path", "") or "")
         if path:
             downloaded_paths.append((index, path.rstrip("/")))
+        for staged in basenames(str(record.get("written_paths", "") or "")):
+            staged_paths.append((index, staged))
         if record.get("archive_creation") and record.get("archive_path"):
-            archive_paths.append((index, str(record["archive_path"])))
+            staged_paths.append((index, str(record["archive_path"]).rsplit("/", 1)[-1]))
         if on(record, "network_download", "embedded_download_exec"):
             has_download = True
         if on(record, "crontab_edit", "systemd_unit_write", "authorized_keys_write",
-              "shell_startup_write", "preload_persistence", "service_enable"):
+              "shell_startup_write", "preload_persistence", "service_enable", "persistence_hook_write"):
             has_persistence = True
 
         # a later command executes a path an earlier one downloaded
@@ -232,40 +247,44 @@ def _session_hits(commands: Sequence[str], records: Sequence[Record],
                         or command.strip().startswith(("./", "/", "sh ", "bash ")):
                     executed_after_download = True
 
-        # a later command sends an archive an earlier one created
-        if on(record, "upload_indicator", "network_upload", "remote_copy", "transfer_over_socket_tool"):
-            for prior_index, prior_path in archive_paths:
-                base = prior_path.rsplit("/", 1)[-1]
+        # a later command sends data an earlier one staged on disk
+        if on(record, *TRANSFER):
+            for prior_index, base in staged_paths:
                 if prior_index < index and base and base in command:
-                    archive_then_network = True
+                    staged_then_network = True
+                    sent_basenames.append(base)
+
+        # a staged or sent artifact is deleted later
+        if on(record, "file_delete_indicator") or command.strip().startswith(("rm ", "shred ", "unlink ")):
+            for prior_index, base in staged_paths:
+                if prior_index < index and base and (base in command or base in sent_basenames):
+                    cleanup_after_exfil = True
 
         # credential access, then a later upload
-        if cred_index is None and on(record, "touches_shadow", "private_key_file_access",
-                                     "cloud_credential_reference", "credential_search",
-                                     "credential_file_reference"):
+        if cred_index is None and on(record, *CREDENTIAL):
             cred_index = index
-        elif cred_index is not None and index > cred_index and on(
-                record, "upload_indicator", "network_upload", "remote_copy",
-                "transfer_over_socket_tool", "exfil_service_domain"):
+        elif cred_index is not None and index > cred_index and on(record, *TRANSFER, "exfil_service_domain"):
             upload_after_cred = True
 
-    # cover-tracks: history/log clearing after earlier substantive activity
-    cleared_tracks_after = any(
-        on(record, "history_cleared", "log_tampering") and any(a.score >= 15 for a in per_command[:index])
-        for index, record in enumerate(records))
+        # privilege escalation, then later credential access
+        if escalation_index is None and on(record, *ESCALATION):
+            escalation_index = index
+        elif escalation_index is not None and index > escalation_index and on(record, *CREDENTIAL):
+            escalation_then_cred = True
+
+    # cover-tracks: history/log clearing in a session with other substantive activity
+    tamper = [i for i, r in enumerate(records) if on(r, "history_cleared", "log_tampering")]
+    cover_tracks = any(any(j != i and per_command[j].score >= 15 for j in range(len(records))) for i in tamper)
     tactics_seen = {t for a in per_command for t in a.tactics if t != "discovery"}
 
-    hits: List[Signal] = []
-    if executed_after_download:
-        hits.append(SESSION_SIGNALS["staged_download_execution"])
-    if archive_then_network:
-        hits.append(SESSION_SIGNALS["collect_then_exfiltrate"])
-    if upload_after_cred:
-        hits.append(SESSION_SIGNALS["credential_access_then_upload"])
-    if has_download and has_persistence:
-        hits.append(SESSION_SIGNALS["download_and_persist"])
-    if cleared_tracks_after:
-        hits.append(SESSION_SIGNALS["cover_tracks"])
-    if len(tactics_seen) >= 3:
-        hits.append(SESSION_SIGNALS["multi_stage"])
-    return hits
+    fired = [
+        ("staged_download_execution", executed_after_download),
+        ("collect_then_exfiltrate", staged_then_network),
+        ("credential_access_then_upload", upload_after_cred),
+        ("cleanup_after_exfiltration", cleanup_after_exfil),
+        ("escalation_then_credential_access", escalation_then_cred),
+        ("download_and_persist", has_download and has_persistence),
+        ("cover_tracks", cover_tracks),
+        ("multi_stage", len(tactics_seen) >= 3),
+    ]
+    return [SESSION_SIGNALS[name] for name, ok in fired if ok]

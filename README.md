@@ -114,16 +114,34 @@ every point of the score traces to a named signal and a MITRE ATT&CK technique.
 
 1. **Features.** The command is lexed (without executing anything), wrappers
    such as `sudo`/`env`/`xargs` are unwrapped, substitutions and `-c` payloads
-   are descended into, and ~110 deterministic features are computed — download
+   are descended into, and deterministic features are computed — download
    chains, paths touched, persistence surfaces, encoding tricks, and a
-   `tradecraft` group that recognises specific attacker techniques by shape
-   (reverse shells, `/dev/tcp`, disk wipes, log tampering, disabling EDR/audit,
-   cloud-metadata credential theft, miners, offensive tools, host-namespace
-   entry, …).
-2. **Signals.** `malscore/signals.py` is a catalogue of ~90 named signals: a
+   `tradecraft` group (`malscore/tradecraft.py`) that recognises specific
+   attacker techniques by shape.
+2. **Signals.** `malscore/signals.py` is a catalogue of ~120 named signals: a
    predicate over the feature record, a weight in `(0, 1]`, a MITRE tactic and
    technique ids. A weight reads as "how likely is this hostile if it
-   were the only thing we knew".
+   were the only thing we knew". The catalogue spans, by ATT&CK tactic:
+   - **execution** — interpreter from a download, decoded payloads, TTY upgrades,
+     fileless execution from `/proc/self/fd`;
+   - **credential access** — `/etc/shadow` and private keys, cloud metadata,
+     credential-keyword searches over config files, reads of `.pgpass`/`.netrc`/
+     cloud credential files, environment and history scraping, SSH-agent hijack;
+   - **privilege escalation** — reverse shells, sudoers edits, setuid, container
+     escape, interactive root shells, GTFOBins shell escapes, the `sudo -u#-1`
+     bypass, PATH hijacks;
+   - **collection / exfiltration** — archives and database dumps, access to
+     tables or files holding card numbers / tokens / customer data, regex hunts
+     for card numbers and SSNs, DNS and encoded exfiltration, paste/webhook
+     services;
+   - **defense evasion** — history and log tampering, disabling EDR/audit,
+     clearing immutable flags, `/proc` bind-mount hiding;
+   - **persistence / impact** — cron, systemd, login hooks, disk wipes, fork
+     bombs, miners, `DROP TABLE`, mass process kills.
+
+   The generic sensitive-data rules (card/SSN patterns, database dumps, table
+   names such as `card`, `token`, `customer`) ship on by default; tune the
+   `SENSITIVE_TABLE_RE` vocabulary in `malscore/tradecraft.py` for your own data.
 3. **Aggregation (noisy‑OR).** Weights combine as `1 − ∏(1 − wᵢ)`, so many weak
    signals accumulate but never overflow and one strong signal dominates.
    Redundant signals that share a tactic are damped, so tripping three
@@ -131,10 +149,11 @@ every point of the score traces to a named signal and a MITRE ATT&CK technique.
 4. **Sessions.** Each command in a session is scored as above (its
    contribution capped at 0.9, so one noisy command does not make a long session
    critical), and then **cross‑command** signals look for patterns no single
-   command shows — a file downloaded early and run later, a `tar` whose archive
-   is `scp`‑ed away, credential access followed by an upload, download plus
-   persistence, activity followed by history/log clearing, or activity spanning
-   three or more tactics.
+   command shows — a file downloaded early and run later, data staged (dumped,
+   archived or compressed) and later `scp`‑ed away, credential access after a
+   privilege escalation, an upload after credential access, staged data deleted
+   once sent, download plus persistence, activity followed by history/log
+   clearing, or activity spanning three or more tactics.
 
 ### Why a static score is not the whole story
 
@@ -169,7 +188,8 @@ The intended production shape is a hybrid:
 | `malscore.py` | standalone entry point (`python3 malscore.py …`) |
 | `malscore/lexer.py` | non-executing shell lexer |
 | `malscore/context.py` | resolves executables, payloads, paths, URLs, IPs, ports |
-| `malscore/features.py` | computes the feature record for one command line |
+| `malscore/features.py` | generic feature groups (network, paths, persistence, …) |
+| `malscore/tradecraft.py` | technique-specific features (reverse shells, credential hunting, …) |
 | `malscore/signals.py` | weighted, MITRE-mapped signal catalogue |
 | `malscore/scoring.py` | noisy-OR scoring and cross-command session analysis |
 | `malscore/cli.py` | command-line interface |
@@ -200,9 +220,9 @@ text is echoed back; scores are unaffected.
 
 ## Extending the scorer
 
-* **New technique detection** → compute a feature in `malscore/features.py`
-  (the `tradecraft` group holds technique-specific shapes) and return it from
-  the group function.
+* **New technique detection** → add a feature to `malscore/tradecraft.py`
+  (grouped by ATT&CK tactic) and return it from one of the group functions, or
+  to a generic group in `malscore/features.py`.
 * **New weighting** → add a `Signal` to `malscore/signals.py` with a
   weight, tactic and technique ids. No other file needs to change.
 
