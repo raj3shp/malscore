@@ -1,5 +1,9 @@
 # malscore — maliciousness scoring for Linux commands
 
+[![PyPI](https://img.shields.io/pypi/v/malscore.svg)](https://pypi.org/project/malscore/)
+[![Python versions](https://img.shields.io/pypi/pyversions/malscore.svg)](https://pypi.org/project/malscore/)
+[![License](https://img.shields.io/pypi/l/malscore.svg)](LICENSE)
+
 `malscore` takes a Linux command line, or a session of commands such as a shell
 history, and returns a **0–100 maliciousness score** with a verdict band and
 MITRE ATT&CK mapping:
@@ -17,9 +21,14 @@ standard library (3.8+).
 ## Install
 
 ```bash
-pip install .             # provides the `malscore` command
-# or run straight from a checkout:
-python3 malscore.py "<command>"
+pip install malscore       # provides the `malscore` command
+```
+
+From a source checkout:
+
+```bash
+pip install .              # or run without installing, from the repo root:
+python3 -m malscore "<command>"
 ```
 
 ## Quickstart
@@ -181,18 +190,26 @@ The intended production shape is a hybrid:
 
 ---
 
+## Documentation
+
+- [docs/usage.md](docs/usage.md) — full CLI reference and the Python API
+- [docs/signals.md](docs/signals.md) — every signal, its weight, tactic and techniques
+- [docs/architecture.md](docs/architecture.md) — the pipeline, safety guarantee, and how to extend it
+- [CHANGELOG.md](CHANGELOG.md) · [CONTRIBUTING.md](CONTRIBUTING.md)
+
+---
+
 ## Layout
 
 | file | role |
 | --- | --- |
-| `malscore.py` | standalone entry point (`python3 malscore.py …`) |
 | `malscore/lexer.py` | non-executing shell lexer |
 | `malscore/context.py` | resolves executables, payloads, paths, URLs, IPs, ports |
 | `malscore/features.py` | generic feature groups (network, paths, persistence, …) |
 | `malscore/tradecraft.py` | technique-specific features (reverse shells, credential hunting, …) |
 | `malscore/signals.py` | weighted, MITRE-mapped signal catalogue |
 | `malscore/scoring.py` | noisy-OR scoring and cross-command session analysis |
-| `malscore/cli.py` | command-line interface |
+| `malscore/cli.py` | command-line interface (`malscore` / `python -m malscore`) |
 
 ---
 
