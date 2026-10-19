@@ -1,10 +1,5 @@
 <h1 align="center">🦠 malscore</h1>
 
-<p align="center">
-  <b>Maliciousness scoring for Linux commands and shell sessions.</b><br>
-  A 0–100 score with a verdict band and MITRE ATT&CK mapping —
-  computed purely by reading the text, never by executing it.
-</p>
 
 <p align="center">
   <a href="https://pypi.org/project/malscore/"><img src="https://img.shields.io/pypi/v/malscore.svg" alt="PyPI version"></a>
