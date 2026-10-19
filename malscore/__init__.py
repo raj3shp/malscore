@@ -14,7 +14,7 @@ from __future__ import annotations
 from .scoring import Analyzer, Assessment, verdict_for
 from .signals import SESSION_SIGNALS, SIGNALS, Signal
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 __all__ = [
     "Analyzer",

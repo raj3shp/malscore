@@ -6,6 +6,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-19
+
+Packaging and documentation fixes; no library changes.
+
+### Fixed
+- Use absolute GitHub URLs for the documentation and license links in the README
+  so they resolve on the PyPI project page instead of 404-ing.
+
+### Changed
+- Report Python support on PyPI through `Requires-Python` only; dropped the
+  per-version `Programming Language :: Python :: 3.x` classifiers.
+- Prettier centered README header (title, tagline, badge row).
+
 ## [0.1.0] - 2026-10-19
 
 Initial release.
@@ -31,5 +44,6 @@ Initial release.
   `verdict_for`.
 - Zero runtime dependencies; Python 3.8+.
 
-[Unreleased]: https://github.com/raj3shp/malscore/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/raj3shp/malscore/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/raj3shp/malscore/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/raj3shp/malscore/releases/tag/v0.1.0
