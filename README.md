@@ -4,7 +4,7 @@
 <p align="center">
   <a href="https://pypi.org/project/malscore/"><img src="https://img.shields.io/pypi/v/malscore.svg" alt="PyPI version"></a>
   <a href="https://pypi.org/project/malscore/"><img src="https://img.shields.io/badge/python-3.8+-blue.svg" alt="Python 3.8+"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/pypi/l/malscore.svg" alt="License: Apache-2.0"></a>
+  <a href="https://github.com/raj3shp/malscore/blob/main/LICENSE"><img src="https://img.shields.io/pypi/l/malscore.svg" alt="License: Apache-2.0"></a>
   <img src="https://img.shields.io/badge/dependencies-none-brightgreen.svg" alt="Zero dependencies">
   <img src="https://img.shields.io/badge/MITRE%20ATT%26CK-mapped-C5203E.svg" alt="MITRE ATT&CK mapped">
 </p>
@@ -219,10 +219,10 @@ The intended production shape is a hybrid:
 
 ## Documentation
 
-- [docs/usage.md](docs/usage.md) — full CLI reference and the Python API
-- [docs/signals.md](docs/signals.md) — every signal, its weight, tactic and techniques
-- [docs/architecture.md](docs/architecture.md) — the pipeline, safety guarantee, and how to extend it
-- [CHANGELOG.md](CHANGELOG.md) · [CONTRIBUTING.md](CONTRIBUTING.md)
+- [docs/usage.md](https://github.com/raj3shp/malscore/blob/main/docs/usage.md) — full CLI reference and the Python API
+- [docs/signals.md](https://github.com/raj3shp/malscore/blob/main/docs/signals.md) — every signal, its weight, tactic and techniques
+- [docs/architecture.md](https://github.com/raj3shp/malscore/blob/main/docs/architecture.md) — the pipeline, safety guarantee, and how to extend it
+- [CHANGELOG.md](https://github.com/raj3shp/malscore/blob/main/CHANGELOG.md) · [CONTRIBUTING.md](https://github.com/raj3shp/malscore/blob/main/CONTRIBUTING.md)
 
 ---
 
